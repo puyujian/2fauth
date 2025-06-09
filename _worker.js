@@ -1018,7 +1018,7 @@ function getMainHTML() {
 			<span class="oauth-icon">
 				<img src="https://linux.do/uploads/default/original/3X/b/4/b4fa45d8b03df61f5d011e173c0adf8497028b16.png" 
 					 alt="Logo" 
-					 style="width: 24px; height: 24px; object-fit: contain;">
+					 style="width: 70px; height: 70px; object-fit: contain;">
 			</span>
 			<span>账号登录</span>
 		</button>
