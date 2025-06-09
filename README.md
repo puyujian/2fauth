@@ -54,8 +54,8 @@
 1.  **克隆仓库**
 
     ```bash
-    git clone https://github.com/your-username/2fa-secure-manager.git
-    cd 2fa-secure-manager
+    git clone https://github.com/ilikeeu/2fauth.git
+    cd 2fauth
     ```
 
 2.  **安装依赖**
