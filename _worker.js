@@ -1016,11 +1016,11 @@ function getMainHTML() {
                     
 		<button onclick="startOAuthLogin()" class="oauth-login-btn">
 			<span class="oauth-icon">
-				<img src="https://mcncc.com/assets/favicon-l3lowwbg.png" 
+				<img src="https://linux.do/uploads/default/original/3X/b/4/b4fa45d8b03df61f5d011e173c0adf8497028b16.png" 
 					 alt="Logo" 
 					 style="width: 24px; height: 24px; object-fit: contain;">
 			</span>
-			<span>第三方授权登录</span>
+			<span>账号登录</span>
 		</button>
 
                     
