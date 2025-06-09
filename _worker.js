@@ -1305,7 +1305,7 @@ async function handleOAuthAuthorize(request, env) {
             state: state
         });
         
-        const authUrl = `${env.OAUTH_BASE_URL}/oauth/authorize?${params}`;
+        const authUrl = `${env.OAUTH_BASE_URL}/oauth2/authorize?${params}`;
         
         console.log('Redirecting to OAuth URL:', authUrl);
         
@@ -1705,7 +1705,7 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
         console.log('State verified successfully');
         
         // 使用环境变量中的配置
-        const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth/token`, {
+        const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth2/token`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
@@ -1763,7 +1763,7 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
                 username: userData.username,
                 nickname: userData.nickname,
                 email: userData.email,
-                avatar_url: userData.avatar_url
+                avatar_template: userData.avatar_template
             },
             ip: clientIP,
             loginMethod: 'oauth',
@@ -3853,8 +3853,8 @@ function getMainHTML() {
                 document.getElementById('userEmail').textContent = userInfo.email || '';
                 
                 const avatarImg = document.getElementById('userAvatar');
-                if (userInfo.avatar_url) {
-                    avatarImg.src = userInfo.avatar_url;
+                if (userInfo.avatar_template) {
+                    avatarImg.src = userInfo.avatar_template;
                     avatarImg.style.display = 'block';
                 } else {
                     avatarImg.style.display = 'none';
