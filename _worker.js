@@ -1018,7 +1018,7 @@ function getMainHTML() {
 			<span class="oauth-icon">
 				<img src="https://linux.do/logo-256.svg" 
 					 alt="Logo" 
-					 style="width: 70px; height: 70px; object-fit: contain;">
+					 style="width: 40px; height: 40px; object-fit: contain;">
 			</span>
 			<span>使用Linux.do账号登录</span>
 		</button>
