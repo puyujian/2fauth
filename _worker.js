@@ -1,4 +1,4 @@
-// 完整2FA管理系统 - OAuth授权登录版本（支持2FAuth v5.5.2格式）
+// 完整2FA管理系统 - OAuth授权登录版本（支持2FAuth v5.5.2格式 ）
 const BASE32_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 // ===== 安全配置 =====
