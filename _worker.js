@@ -1016,11 +1016,11 @@ function getMainHTML() {
                     
 		<button onclick="startOAuthLogin()" class="oauth-login-btn">
 			<span class="oauth-icon">
-				<img src="https://linux.do/uploads/default/original/3X/b/4/b4fa45d8b03df61f5d011e173c0adf8497028b16.png" 
+				<img src="https://linux.do/logo-256.svg" 
 					 alt="Logo" 
 					 style="width: 70px; height: 70px; object-fit: contain;">
 			</span>
-			<span>账号登录</span>
+			<span>使用Linux.do账号登录</span>
 		</button>
 
                     
