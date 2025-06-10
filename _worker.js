@@ -5844,7 +5844,7 @@ export default {
                         'X-Content-Type-Options': 'nosniff',
                         'X-Frame-Options': 'DENY',
                         'Referrer-Policy': 'strict-origin-when-cross-origin',
-			'Content-Security-Policy': "default-src 'self' data:; script-src 'self' 'unsafe-inline' https://jsdelivr.b-cdn.net; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: https:; connect-src 'self';"
+			'Content-Security-Policy': "default-src 'self' data:; script-src 'self' 'unsafe-inline' https://jsdelivr.b-cdn.net; style-src 'self' 'unsafe-inline' data: https://jsdelivr.b-cdn.net; font-src 'self' data: https://jsdelivr.b-cdn.net; img-src 'self' data: https:; connect-src 'self';"
                     }
                 });
             }
