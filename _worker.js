@@ -979,7 +979,7 @@ function getMainHTML() {
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
     <meta http-equiv="X-Frame-Options" content="DENY">
     <meta http-equiv="Referrer-Policy" content="strict-origin-when-cross-origin">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="https://jsdelivr.b-cdn.net/npm/@fortawesome/fontawesome-free@6.0.0/css/all.min.css">
 
 
     <title>🔐 2FA 安全管理系统</title>
