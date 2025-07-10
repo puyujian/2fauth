@@ -11,6 +11,8 @@
 ### 🛡️ 安全特性
 
   * **OAuth 2.0 授权登录** - 支持第三方 OAuth 服务安全认证
+  * **自动账号管理** - OAuth登录时自动创建或绑定用户账号
+  * **多用户数据隔离** - 每个用户的数据完全独立，互不可见
   * **端到端加密** - 所有敏感数据使用 AES-GCM 加密存储
   * **JWT 会话管理** - 2小时自动过期的安全会话
   * **速率限制保护** - 防止暴力攻击和 API 滥用
@@ -86,7 +88,7 @@
     [vars]
     OAUTH_BASE_URL = "https://your-oauth-server.com"
     OAUTH_REDIRECT_URI = "https://your-domain.workers.dev/api/oauth/callback"
-    OAUTH_ID = "authorized_user_id"
+    # OAUTH_ID = "authorized_user_id"  # 可选：向后兼容，新版本支持自动用户注册
 
     [env.production.vars]
     ALLOWED_ORIGINS = "https://your-domain.workers.dev"
@@ -143,7 +145,7 @@ OAUTH_BASE_URL=https://github.com
 OAUTH_CLIENT_ID=your_github_client_id
 OAUTH_CLIENT_SECRET=your_github_client_secret
 OAUTH_REDIRECT_URI=https://your-app.workers.dev/api/oauth/callback
-OAUTH_ID=your_github_user_id
+# OAUTH_ID不再是必需的，系统支持自动用户注册
 ```
 
 #### 自建 OAuth 服务器
@@ -153,7 +155,7 @@ OAUTH_BASE_URL=https://your-oauth-server.com
 OAUTH_CLIENT_ID=your_client_id
 OAUTH_CLIENT_SECRET=your_client_secret
 OAUTH_REDIRECT_URI=https://your-app.workers.dev/api/oauth/callback
-OAUTH_ID=your_user_id
+# OAUTH_ID不再是必需的，系统支持自动用户注册
 ```
 
 -----
@@ -164,9 +166,13 @@ OAUTH_ID=your_user_id
 
 1.  **登录系统**
 
-      * 点击"第三方授权登录"按钮
-      * 在 OAuth 服务器完成授权
-      * 自动跳转回系统主界面
+      * **OAuth登录**：点击"第三方授权登录"按钮
+        - 在 OAuth 服务器完成授权
+        - 系统自动创建或绑定您的账号
+        - 自动跳转回系统主界面
+      * **密码登录**：使用用户名/邮箱和密码登录
+        - 支持用户注册功能
+        - 与OAuth账号完全独立
 
 2.  **添加 2FA 账户**
 
@@ -224,6 +230,7 @@ OAUTH_ID=your_user_id
   * **传输安全**：全程 HTTPS 加密传输
   * **密钥管理**：使用强随机密钥和盐值
   * **访问控制**：基于 OAuth 2.0 的身份验证
+  * **自动账号管理**：OAuth登录时自动创建或绑定账号
 
 ### 隐私保护
 
@@ -231,6 +238,7 @@ OAUTH_ID=your_user_id
   * **数据隔离**：每个用户的数据完全隔离
   * **会话管理**：2小时自动过期的安全会话
   * **审计日志**：记录但不存储敏感操作详情
+  * **用户隔离**：每个OAuth账号独立管理，数据互不可见
 
 ### 安全建议
 

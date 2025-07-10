@@ -13,13 +13,107 @@ const SECURITY_CONFIG = {
     OAUTH_LOCKOUT_TIME: 10 * 60 * 1000,
     SESSION_TIMEOUT: 2 * 60 * 60 * 1000,
     MAX_FILE_SIZE: 10 * 1024 * 1024,
-    ALLOWED_FILE_TYPES: ['application/json', 'text/plain', 'image/jpeg', 'image/png', 'image/gif', 'image/webp']
+    ALLOWED_FILE_TYPES: ['application/json', 'text/plain', 'image/jpeg', 'image/png', 'image/gif', 'image/webp'],
+    // 新增密码认证相关配置
+    MIN_PASSWORD_LENGTH: 8,
+    PBKDF2_ITERATIONS: 100000,
+    SALT_LENGTH: 16,
+    MAX_USERNAME_LENGTH: 30,
+    MAX_EMAIL_LENGTH: 100
+};
+
+// ===== 存储键名规范 =====
+const STORAGE_KEYS = {
+    USERS_REGISTRY: 'auth_users_registry',
+    USER_ACCOUNTS: 'user_{userId}_accounts_encrypted',
+    USER_WEBDAV: 'user_{userId}_webdav_configs',
+    LOGIN_ATTEMPTS: 'login_attempts_{ip}',
+    MIGRATION_STATUS: 'migration_completed',
+    MIGRATED_OAUTH_USER: 'migrated_oauth_user_id'
 };
 
 // ===== 工具函数 =====
 function sanitizeInput(input, maxLength = SECURITY_CONFIG.MAX_INPUT_LENGTH) {
     if (typeof input !== 'string') return '';
     return input.replace(/[<>"'&\x00-\x1F\x7F]/g, '').trim().substring(0, maxLength);
+}
+
+// ===== 密码安全函数 =====
+async function hashPassword(password, providedSalt) {
+    const encoder = new TextEncoder();
+    const salt = providedSalt || crypto.getRandomValues(new Uint8Array(SECURITY_CONFIG.SALT_LENGTH));
+
+    const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(password),
+        { name: "PBKDF2" },
+        false,
+        ["deriveBits", "deriveKey"]
+    );
+
+    const key = await crypto.subtle.deriveKey(
+        {
+            name: "PBKDF2",
+            salt: salt,
+            iterations: SECURITY_CONFIG.PBKDF2_ITERATIONS,
+            hash: "SHA-256",
+        },
+        keyMaterial,
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["encrypt", "decrypt"]
+    );
+
+    const exportedKey = await crypto.subtle.exportKey("raw", key);
+    const hashBuffer = new Uint8Array(exportedKey);
+    const hashArray = Array.from(hashBuffer);
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+    const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, "0")).join("");
+
+    return `${saltHex}:${hashHex}`;
+}
+
+async function verifyPassword(storedHash, passwordAttempt) {
+    try {
+        const [saltHex, originalHash] = storedHash.split(":");
+        const matchResult = saltHex.match(/.{1,2}/g);
+        if (!matchResult) {
+            throw new Error("Invalid salt format");
+        }
+        const salt = new Uint8Array(matchResult.map(byte => parseInt(byte, 16)));
+        const attemptHashWithSalt = await hashPassword(passwordAttempt, salt);
+        const [, attemptHash] = attemptHashWithSalt.split(":");
+        return attemptHash === originalHash;
+    } catch (error) {
+        console.error('Password verification error:', error);
+        return false;
+    }
+}
+
+function validatePasswordStrength(password) {
+    if (!password || typeof password !== 'string') {
+        return { isValid: false, requirements: {} };
+    }
+
+    const minLength = SECURITY_CONFIG.MIN_PASSWORD_LENGTH;
+    const hasUpper = /[A-Z]/.test(password);
+    const hasLower = /[a-z]/.test(password);
+    // 使用兼容性更好的数字检测方法
+    const hasNumber = /[0-9]/.test(password);
+    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+
+    const requirements = {
+        length: password.length >= minLength,
+        uppercase: hasUpper,
+        lowercase: hasLower,
+        number: hasNumber,
+        special: hasSpecial
+    };
+
+    return {
+        isValid: requirements.length && requirements.uppercase && requirements.lowercase && requirements.number && requirements.special,
+        requirements: requirements
+    };
 }
 
 function validateBase32Secret(secret) {
@@ -32,6 +126,297 @@ function validateServiceName(service) {
     if (!service || typeof service !== 'string') return false;
     const cleaned = sanitizeInput(service, 50);
     return cleaned.length >= 1 && cleaned.length <= 50;
+}
+
+// ===== 用户管理函数 =====
+function validateUsername(username) {
+    if (!username || typeof username !== 'string') return false;
+    const cleaned = sanitizeInput(username, SECURITY_CONFIG.MAX_USERNAME_LENGTH);
+    // 用户名只允许字母、数字、下划线和连字符
+    return /^[a-zA-Z0-9_-]+$/.test(cleaned) && cleaned.length >= 3 && cleaned.length <= SECURITY_CONFIG.MAX_USERNAME_LENGTH;
+}
+
+function validateEmail(email) {
+    if (!email || typeof email !== 'string') return false;
+    const cleaned = sanitizeInput(email, SECURITY_CONFIG.MAX_EMAIL_LENGTH);
+    // 简单的邮箱格式验证
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned) && cleaned.length <= SECURITY_CONFIG.MAX_EMAIL_LENGTH;
+}
+
+async function generateUniqueUsername(baseUsername, env) {
+    const users = await getUsersRegistry(env);
+    let username = sanitizeInput(baseUsername, SECURITY_CONFIG.MAX_USERNAME_LENGTH);
+    let counter = 1;
+    let isUnique = false;
+
+    // 检查用户名是否已存在，如果存在则添加数字后缀
+    while (!isUnique) {
+        const exists = Object.values(users).some(user => user.username === username);
+        if (!exists) {
+            isUnique = true;
+        } else {
+            username = `${baseUsername}${counter}`.substring(0, SECURITY_CONFIG.MAX_USERNAME_LENGTH);
+            counter++;
+        }
+    }
+
+    return username;
+}
+
+async function generateUniqueEmail(baseEmail, env) {
+    const users = await getUsersRegistry(env);
+    let email = sanitizeInput(baseEmail, SECURITY_CONFIG.MAX_EMAIL_LENGTH);
+    let counter = 1;
+    let isUnique = false;
+
+    // 如果邮箱不符合格式，直接返回系统生成的邮箱
+    if (!validateEmail(email)) {
+        const randomId = crypto.randomUUID().substring(0, 8);
+        return `oauth_user_${randomId}@system.local`;
+    }
+
+    // 检查邮箱是否已存在，如果存在则在@前添加数字后缀
+    while (!isUnique) {
+        const exists = Object.values(users).some(user => user.email === email);
+        if (!exists) {
+            isUnique = true;
+        } else {
+            const [localPart, domain] = email.split('@');
+            email = `${localPart}${counter}@${domain}`.substring(0, SECURITY_CONFIG.MAX_EMAIL_LENGTH);
+            counter++;
+        }
+    }
+
+    return email;
+}
+
+async function getUsersRegistry(env) {
+    try {
+        const data = await env.USER_DATA.get(STORAGE_KEYS.USERS_REGISTRY);
+        return data ? JSON.parse(data) : {};
+    } catch (error) {
+        console.error('Failed to load users registry:', error);
+        return {};
+    }
+}
+
+async function saveUsersRegistry(users, env) {
+    try {
+        await env.USER_DATA.put(STORAGE_KEYS.USERS_REGISTRY, JSON.stringify(users));
+        return true;
+    } catch (error) {
+        console.error('Failed to save users registry:', error);
+        return false;
+    }
+}
+
+async function findUserByUsername(username, env) {
+    const users = await getUsersRegistry(env);
+    return Object.values(users).find(user => user.username === username) || null;
+}
+
+async function findUserByEmail(email, env) {
+    const users = await getUsersRegistry(env);
+    return Object.values(users).find(user => user.email === email) || null;
+}
+
+async function findUserByUsernameOrEmail(username, email, env) {
+    const users = await getUsersRegistry(env);
+    return Object.values(users).find(user =>
+        user.username === username || user.email === email
+    ) || null;
+}
+
+async function findUserById(userId, env) {
+    const users = await getUsersRegistry(env);
+    return users[userId] || null;
+}
+
+async function findUserByOAuthId(oauthId, env) {
+    const users = await getUsersRegistry(env);
+    return Object.values(users).find(user => user.oauthId === oauthId.toString()) || null;
+}
+
+async function createUser(username, email, password, env) {
+    const userId = crypto.randomUUID();
+    const passwordHash = await hashPassword(password);
+
+    const user = {
+        id: userId,
+        username: sanitizeInput(username, SECURITY_CONFIG.MAX_USERNAME_LENGTH),
+        email: sanitizeInput(email, SECURITY_CONFIG.MAX_EMAIL_LENGTH),
+        passwordHash: passwordHash,
+        oauthId: null,
+        loginMethods: ['password'],
+        createdAt: new Date().toISOString(),
+        lastLoginAt: null,
+        isActive: true,
+        failedAttempts: 0,
+        lockedUntil: null
+    };
+
+    const users = await getUsersRegistry(env);
+    users[userId] = user;
+
+    const saved = await saveUsersRegistry(users, env);
+    if (!saved) {
+        throw new Error('Failed to save user');
+    }
+
+    return user;
+}
+
+async function createOAuthUser(userData, env) {
+    const userId = crypto.randomUUID();
+
+    // 生成用户名，确保唯一性
+    let username = userData.username || `oauth_user_${userData.id}`;
+    username = await generateUniqueUsername(username, env);
+
+    // 生成邮箱，确保唯一性
+    let email = userData.email;
+    if (!email || !validateEmail(email)) {
+        email = `oauth_${userData.id}@system.local`;
+    }
+    email = await generateUniqueEmail(email, env);
+
+    const user = {
+        id: userId,
+        username: sanitizeInput(username, SECURITY_CONFIG.MAX_USERNAME_LENGTH),
+        email: sanitizeInput(email, SECURITY_CONFIG.MAX_EMAIL_LENGTH),
+        passwordHash: null,
+        oauthId: userData.id.toString(),
+        loginMethods: ['oauth'],
+        createdAt: new Date().toISOString(),
+        lastLoginAt: new Date().toISOString(),
+        isActive: true,
+        failedAttempts: 0,
+        lockedUntil: null
+    };
+
+    const users = await getUsersRegistry(env);
+    users[userId] = user;
+
+    const saved = await saveUsersRegistry(users, env);
+    if (!saved) {
+        throw new Error('Failed to save OAuth user');
+    }
+
+    return user;
+}
+
+async function updateLastLogin(userId, env) {
+    const users = await getUsersRegistry(env);
+    if (users[userId]) {
+        users[userId].lastLoginAt = new Date().toISOString();
+        await saveUsersRegistry(users, env);
+    }
+}
+
+async function incrementFailedAttempts(userId, env) {
+    const users = await getUsersRegistry(env);
+    if (users[userId]) {
+        users[userId].failedAttempts = (users[userId].failedAttempts || 0) + 1;
+        if (users[userId].failedAttempts >= SECURITY_CONFIG.MAX_LOGIN_ATTEMPTS) {
+            users[userId].lockedUntil = new Date(Date.now() + SECURITY_CONFIG.LOCKOUT_TIME).toISOString();
+        }
+        await saveUsersRegistry(users, env);
+    }
+}
+
+async function clearFailedAttempts(userId, env) {
+    const users = await getUsersRegistry(env);
+    if (users[userId]) {
+        users[userId].failedAttempts = 0;
+        users[userId].lockedUntil = null;
+        await saveUsersRegistry(users, env);
+    }
+}
+
+async function isUserLocked(userId, env) {
+    const users = await getUsersRegistry(env);
+    const user = users[userId];
+    if (!user || !user.lockedUntil) return false;
+
+    const lockTime = new Date(user.lockedUntil).getTime();
+    const now = Date.now();
+
+    if (now > lockTime) {
+        // 锁定时间已过，清除锁定状态
+        await clearFailedAttempts(userId, env);
+        return false;
+    }
+
+    return true;
+}
+
+// ===== 登录尝试管理 =====
+async function checkLoginAttempts(ip, env) {
+    try {
+        const key = STORAGE_KEYS.LOGIN_ATTEMPTS.replace('{ip}', ip);
+        const data = await env.USER_DATA.get(key);
+
+        if (!data) {
+            return { isLocked: false, attempts: 0 };
+        }
+
+        const attempts = JSON.parse(data);
+        const now = Date.now();
+
+        // 清理过期的尝试记录
+        const validAttempts = attempts.filter(attempt =>
+            now - attempt.timestamp < SECURITY_CONFIG.LOCKOUT_TIME
+        );
+
+        const failedAttempts = validAttempts.filter(attempt => !attempt.success);
+
+        if (failedAttempts.length >= SECURITY_CONFIG.MAX_LOGIN_ATTEMPTS) {
+            const lastFailedAttempt = failedAttempts[failedAttempts.length - 1];
+            const lockedUntil = lastFailedAttempt.timestamp + SECURITY_CONFIG.LOCKOUT_TIME;
+
+            if (now < lockedUntil) {
+                return {
+                    isLocked: true,
+                    attempts: failedAttempts.length,
+                    lockedUntil: new Date(lockedUntil).toISOString()
+                };
+            }
+        }
+
+        // 更新清理后的记录
+        if (validAttempts.length !== attempts.length) {
+            await env.USER_DATA.put(key, JSON.stringify(validAttempts));
+        }
+
+        return { isLocked: false, attempts: failedAttempts.length };
+
+    } catch (error) {
+        console.error('Failed to check login attempts:', error);
+        return { isLocked: false, attempts: 0 };
+    }
+}
+
+async function recordLoginAttempt(ip, success, method, env) {
+    try {
+        const key = STORAGE_KEYS.LOGIN_ATTEMPTS.replace('{ip}', ip);
+        const data = await env.USER_DATA.get(key);
+        const attempts = data ? JSON.parse(data) : [];
+
+        attempts.push({
+            timestamp: Date.now(),
+            success: success,
+            method: method
+        });
+
+        // 只保留最近的尝试记录
+        const cutoff = Date.now() - SECURITY_CONFIG.LOCKOUT_TIME;
+        const recentAttempts = attempts.filter(attempt => attempt.timestamp > cutoff);
+
+        await env.USER_DATA.put(key, JSON.stringify(recentAttempts));
+
+    } catch (error) {
+        console.error('Failed to record login attempt:', error);
+    }
 }
 
 function validateAccountName(account) {
@@ -376,7 +761,7 @@ async function decryptData(encryptedData, masterKey) {
 const loginAttemptsMap = new Map();
 const oauthAttemptsMap = new Map();
 
-async function checkLoginAttempts(identifier) {
+async function checkMemoryLoginAttempts(identifier) {
     const now = Date.now();
     if (loginAttemptsMap.has(identifier)) {
         const attempts = loginAttemptsMap.get(identifier);
@@ -390,7 +775,7 @@ async function checkLoginAttempts(identifier) {
     return true;
 }
 
-async function recordLoginAttempt(identifier, success) {
+async function recordMemoryLoginAttempt(identifier, success) {
     const now = Date.now();
     if (success) {
         loginAttemptsMap.delete(identifier);
@@ -460,13 +845,33 @@ async function saveWebDAVConfigToKV(configs, env) {
     }
 }
 
-async function loadWebDAVConfigsFromKV(env) {
+async function loadWebDAVConfigsFromKV(env, userId = null) {
     try {
-        const configs = await env.USER_DATA.get('webdav_configs');
+        let key = 'webdav_configs';
+        if (userId) {
+            key = STORAGE_KEYS.USER_WEBDAV.replace('{userId}', userId);
+        }
+
+        const configs = await env.USER_DATA.get(key);
         return configs ? JSON.parse(configs) : [];
     } catch (error) {
         console.error('Failed to load WebDAV configs:', error);
         return [];
+    }
+}
+
+async function saveWebDAVConfigsToKV(configs, env, userId = null) {
+    try {
+        let key = 'webdav_configs';
+        if (userId) {
+            key = STORAGE_KEYS.USER_WEBDAV.replace('{userId}', userId);
+        }
+
+        await env.USER_DATA.put(key, JSON.stringify(configs));
+        return true;
+    } catch (error) {
+        console.error('Failed to save WebDAV configs:', error);
+        return false;
     }
 }
 
@@ -573,6 +978,23 @@ async function generateTOTP(secret, timeStep = 30, digits = 6) {
 }
 
 // ===== JWT 功能 =====
+// 统一的JWT生成函数，支持多种登录方式
+async function generateAuthJWT(user, loginMethod, secret) {
+    const payload = {
+        userInfo: {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            loginMethod: loginMethod  // 'password' | 'oauth'
+        },
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + SECURITY_CONFIG.JWT_EXPIRY,
+        jti: crypto.randomUUID()
+    };
+
+    return await generateSecureJWT(payload, secret);
+}
+
 async function generateSecureJWT(payload, secret) {
     const header = { alg: 'HS256', typ: 'JWT', iat: Math.floor(Date.now() / 1000) };
     const enhancedPayload = {
@@ -622,11 +1044,431 @@ async function verifySecureJWT(token, secret) {
 async function getAuthenticatedUser(request, env) {
     const authHeader = request.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-    
+
     const token = authHeader.substring(7);
     const payload = await verifySecureJWT(token, env.JWT_SECRET);
-    
-    return payload?.userInfo || null;
+
+    if (!payload?.userInfo) return null;
+
+    // 对于新的多用户系统，验证用户是否仍然有效
+    if (payload.userInfo.loginMethod === 'password') {
+        const user = await findUserById(payload.userInfo.id, env);
+        if (!user || !user.isActive) return null;
+    }
+
+    return payload.userInfo;
+}
+
+// ===== 数据迁移功能 =====
+async function migrateExistingData(env) {
+    try {
+        // 检查是否已经迁移
+        const migrationStatus = await env.USER_DATA.get(STORAGE_KEYS.MIGRATION_STATUS);
+        if (migrationStatus === 'true') {
+            console.log('Migration already completed');
+            return { success: true, message: 'Already migrated' };
+        }
+
+        // 检查现有OAuth用户配置
+        const oauthUserId = env.OAUTH_ID;
+        if (!oauthUserId) {
+            console.log('No OAuth user to migrate');
+            await env.USER_DATA.put(STORAGE_KEYS.MIGRATION_STATUS, 'true');
+            return { success: true, message: 'No OAuth user to migrate' };
+        }
+
+        // 创建OAuth用户记录
+        const oauthUser = {
+            id: crypto.randomUUID(),
+            username: `oauth_user_${oauthUserId}`,
+            email: `oauth_${oauthUserId}@system.local`,
+            passwordHash: null,
+            oauthId: oauthUserId,
+            loginMethods: ['oauth'],
+            createdAt: new Date().toISOString(),
+            lastLoginAt: null,
+            isActive: true,
+            failedAttempts: 0,
+            lockedUntil: null
+        };
+
+        // 保存用户记录
+        const users = await getUsersRegistry(env);
+        users[oauthUser.id] = oauthUser;
+        await saveUsersRegistry(users, env);
+
+        // 迁移现有账户数据
+        const existingAccounts = await env.USER_DATA.get('accounts_encrypted');
+        if (existingAccounts) {
+            const newKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', oauthUser.id);
+            await env.USER_DATA.put(newKey, existingAccounts);
+            console.log(`Migrated accounts data to ${newKey}`);
+        }
+
+        // 迁移WebDAV配置
+        const existingWebDAV = await env.USER_DATA.get('webdav_configs');
+        if (existingWebDAV) {
+            const newKey = STORAGE_KEYS.USER_WEBDAV.replace('{userId}', oauthUser.id);
+            await env.USER_DATA.put(newKey, existingWebDAV);
+            console.log(`Migrated WebDAV configs to ${newKey}`);
+        }
+
+        // 标记迁移完成
+        await env.USER_DATA.put(STORAGE_KEYS.MIGRATION_STATUS, 'true');
+        await env.USER_DATA.put(STORAGE_KEYS.MIGRATED_OAUTH_USER, oauthUser.id);
+
+        console.log('Data migration completed successfully');
+        return {
+            success: true,
+            message: 'Migration completed',
+            migratedUserId: oauthUser.id
+        };
+
+    } catch (error) {
+        console.error('Migration failed:', error);
+        return {
+            success: false,
+            message: 'Migration failed',
+            error: error.message
+        };
+    }
+}
+
+async function getMigratedOAuthUser(env) {
+    try {
+        const migratedUserId = await env.USER_DATA.get(STORAGE_KEYS.MIGRATED_OAUTH_USER);
+        if (!migratedUserId) return null;
+
+        return await findUserById(migratedUserId, env);
+    } catch (error) {
+        console.error('Failed to get migrated OAuth user:', error);
+        return null;
+    }
+}
+
+// ===== 数据迁移API =====
+async function handleDataMigration(request, env) {
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400'
+    };
+
+    if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 200, headers: corsHeaders });
+    }
+
+    if (request.method !== 'POST') {
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    try {
+        const migrationResult = await migrateExistingData(env);
+
+        await logSecurityEvent('DATA_MIGRATION_TRIGGERED', migrationResult, request);
+
+        return new Response(JSON.stringify({
+            success: migrationResult.success,
+            message: migrationResult.message,
+            details: migrationResult
+        }), {
+            status: migrationResult.success ? 200 : 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('Migration API error:', error);
+        await logSecurityEvent('DATA_MIGRATION_ERROR', { error: error.message }, request);
+
+        return new Response(JSON.stringify({
+            success: false,
+            error: 'Migration failed',
+            message: error.message
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// ===== 密码登录API =====
+async function handlePasswordLogin(request, env) {
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400'
+    };
+
+    if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 200, headers: corsHeaders });
+    }
+
+    if (request.method !== 'POST') {
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+
+    try {
+        // 检查IP登录尝试限制
+        const attemptCheck = await checkLoginAttempts(clientIP, env);
+        if (attemptCheck.isLocked) {
+            await logSecurityEvent('PASSWORD_LOGIN_BLOCKED', {
+                ip: clientIP,
+                attempts: attemptCheck.attempts,
+                lockedUntil: attemptCheck.lockedUntil
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'Too many failed login attempts. Please try again later.',
+                lockedUntil: attemptCheck.lockedUntil,
+                remainingTime: Math.ceil((new Date(attemptCheck.lockedUntil).getTime() - Date.now()) / 60000) + ' minutes'
+            }), {
+                status: 429,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const { username, password } = await request.json();
+
+        // 输入验证
+        if (!username || !password) {
+            await recordLoginAttempt(clientIP, false, 'password', env);
+            return new Response(JSON.stringify({ error: 'Username and password are required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 查找用户
+        const user = await findUserByUsername(username, env);
+        if (!user || !user.passwordHash) {
+            await recordLoginAttempt(clientIP, false, 'password', env);
+            await logSecurityEvent('PASSWORD_LOGIN_FAILED', {
+                username: username,
+                reason: 'user_not_found_or_no_password'
+            }, request);
+
+            return new Response(JSON.stringify({ error: 'Invalid username or password' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查用户是否被锁定
+        const userLocked = await isUserLocked(user.id, env);
+        if (userLocked) {
+            await recordLoginAttempt(clientIP, false, 'password', env);
+            await logSecurityEvent('PASSWORD_LOGIN_BLOCKED', {
+                userId: user.id,
+                username: user.username,
+                reason: 'user_account_locked'
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'Account is temporarily locked due to too many failed attempts. Please try again later.'
+            }), {
+                status: 423,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 验证密码
+        const isValidPassword = await verifyPassword(user.passwordHash, password);
+        if (!isValidPassword) {
+            await recordLoginAttempt(clientIP, false, 'password', env);
+            await incrementFailedAttempts(user.id, env);
+            await logSecurityEvent('PASSWORD_LOGIN_FAILED', {
+                userId: user.id,
+                username: user.username,
+                reason: 'invalid_password'
+            }, request);
+
+            return new Response(JSON.stringify({ error: 'Invalid username or password' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查用户是否激活
+        if (!user.isActive) {
+            await recordLoginAttempt(clientIP, false, 'password', env);
+            await logSecurityEvent('PASSWORD_LOGIN_FAILED', {
+                userId: user.id,
+                username: user.username,
+                reason: 'account_inactive'
+            }, request);
+
+            return new Response(JSON.stringify({ error: 'Account is inactive' }), {
+                status: 403,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 生成JWT令牌
+        const token = await generateAuthJWT(user, 'password', env.JWT_SECRET);
+
+        // 更新最后登录时间和清除失败尝试
+        await updateLastLogin(user.id, env);
+        await clearFailedAttempts(user.id, env);
+        await recordLoginAttempt(clientIP, true, 'password', env);
+
+        await logSecurityEvent('PASSWORD_LOGIN_SUCCESS', {
+            userId: user.id,
+            username: user.username
+        }, request);
+
+        return new Response(JSON.stringify({
+            success: true,
+            token: token,
+            userInfo: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                loginMethod: 'password',
+                lastLoginAt: user.lastLoginAt
+            }
+        }), {
+            status: 200,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('Password login error:', error);
+        await recordLoginAttempt(clientIP, false, 'password', env);
+        await logSecurityEvent('PASSWORD_LOGIN_ERROR', {
+            error: error.message,
+            ip: clientIP
+        }, request);
+
+        return new Response(JSON.stringify({
+            error: 'Login failed',
+            message: 'Internal server error'
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// ===== 用户注册API =====
+async function handleUserRegistration(request, env) {
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': env.ALLOWED_ORIGINS || '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400'
+    };
+
+    if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 200, headers: corsHeaders });
+    }
+
+    if (request.method !== 'POST') {
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    try {
+        const { username, email, password } = await request.json();
+
+        // 输入验证
+        if (!username || !email || !password) {
+            return new Response(JSON.stringify({ error: 'Missing required fields: username, email, password' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 验证用户名格式
+        if (!validateUsername(username)) {
+            return new Response(JSON.stringify({
+                error: 'Invalid username. Use 3-30 characters, letters, numbers, underscore and hyphen only.'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 验证邮箱格式
+        if (!validateEmail(email)) {
+            return new Response(JSON.stringify({ error: 'Invalid email format' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 密码强度检查
+        const passwordValidation = validatePasswordStrength(password);
+        if (!passwordValidation.isValid) {
+            return new Response(JSON.stringify({
+                error: 'Password does not meet security requirements',
+                requirements: passwordValidation.requirements,
+                message: 'Password must be at least 8 characters and include uppercase, lowercase, number, and special character'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查用户名和邮箱唯一性
+        const existingUser = await findUserByUsernameOrEmail(username, email, env);
+        if (existingUser) {
+            const field = existingUser.username === username ? 'username' : 'email';
+            return new Response(JSON.stringify({
+                error: `This ${field} is already registered`,
+                field: field
+            }), {
+                status: 409,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 创建用户
+        const user = await createUser(username, email, password, env);
+
+        // 记录安全日志
+        await logSecurityEvent('USER_REGISTERED', {
+            userId: user.id,
+            username: user.username,
+            email: user.email
+        }, request);
+
+        return new Response(JSON.stringify({
+            success: true,
+            message: 'User registered successfully',
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                createdAt: user.createdAt
+            }
+        }), {
+            status: 201,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('Registration error:', error);
+        await logSecurityEvent('REGISTRATION_ERROR', { error: error.message }, request);
+        return new Response(JSON.stringify({
+            error: 'Registration failed',
+            message: 'Internal server error'
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
 }
 
 // ===== OAuth相关函数 =====
@@ -910,49 +1752,80 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
         
         // 获取用户信息
         const userData = await fetchOAuthUser(tokenData.access_token, env.OAUTH_BASE_URL);
-        
-        // 验证用户ID
-        if (!userData.id || userData.id.toString() !== env.OAUTH_ID) {
+
+        // 验证用户数据有效性
+        if (!userData.id) {
             await recordOAuthAttempt(clientIP, false);
-            await logSecurityEvent('OAUTH_UNAUTHORIZED', { 
-                userId: userData.id, 
-                username: userData.username,
-                expectedId: env.OAUTH_ID
+            await logSecurityEvent('OAUTH_INVALID_USER', {
+                error: 'Missing user ID from OAuth provider'
             }, request);
-            
-            return new Response(JSON.stringify({ error: 'Unauthorized user' }), {
-                status: 403,
+
+            return new Response(JSON.stringify({ error: 'Invalid user data from OAuth provider' }), {
+                status: 400,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' }
             });
         }
-        
+
+        // 确保数据迁移已完成（保持向后兼容）
+        await migrateExistingData(env);
+
+        // 查找现有OAuth用户
+        let oauthUser = await findUserByOAuthId(userData.id, env);
+
+        // 如果找不到匹配的OAuth用户，尝试查找迁移的用户（向后兼容）
+        if (!oauthUser && env.OAUTH_ID && userData.id.toString() === env.OAUTH_ID) {
+            oauthUser = await getMigratedOAuthUser(env);
+        }
+
+        // 如果仍然找不到用户，创建新用户
+        if (!oauthUser) {
+            try {
+                // 创建新的OAuth用户
+                oauthUser = await createOAuthUser(userData, env);
+
+                // 记录用户创建事件
+                await logSecurityEvent('OAUTH_USER_CREATED', {
+                    userId: oauthUser.id,
+                    username: oauthUser.username,
+                    oauthId: userData.id
+                }, request);
+            } catch (error) {
+                console.error('Failed to create OAuth user:', error);
+                await recordOAuthAttempt(clientIP, false);
+
+                return new Response(JSON.stringify({
+                    error: 'Failed to create user account',
+                    message: error.message
+                }), {
+                    status: 500,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+        } else {
+            // 更新现有用户的最后登录时间
+            await updateLastLogin(oauthUser.id, env);
+        }
+
         // 生成JWT令牌
-        const payload = {
-            userInfo: {
-                id: userData.id,
-                username: userData.username,
-                nickname: userData.nickname,
-                email: userData.email,
-                avatar_template: userData.avatar_template
-            },
-            ip: clientIP,
-            loginMethod: 'oauth',
-            iat: Math.floor(Date.now() / 1000),
-            exp: Math.floor(Date.now() / 1000) + SECURITY_CONFIG.JWT_EXPIRY
-        };
-        
-        const token = await generateSecureJWT(payload, env.JWT_SECRET);
+        const token = await generateAuthJWT(oauthUser, 'oauth', env.JWT_SECRET);
         
         await recordOAuthAttempt(clientIP, true);
-        await logSecurityEvent('OAUTH_SUCCESS', { 
-            userId: userData.id, 
-            username: userData.username 
+        await logSecurityEvent('OAUTH_SUCCESS', {
+            userId: oauthUser.id,
+            username: oauthUser.username,
+            oauthId: userData.id
         }, request);
-        
+
         return new Response(JSON.stringify({
             success: true,
             token,
-            userInfo: payload.userInfo,
+            userInfo: {
+                id: oauthUser.id,
+                username: oauthUser.username,
+                email: oauthUser.email,
+                loginMethod: 'oauth',
+                lastLoginAt: oauthUser.lastLoginAt
+            },
             message: 'OAuth login successful'
         }), {
             status: 200,
@@ -975,9 +1848,10 @@ function getMainHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://jsdelivr.b-cdn.net; style-src 'self' 'unsafe-inline' *; font-src 'self' https://jsdelivr.b-cdn.net; img-src 'self' data: https:; connect-src 'self';"> 
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://jsdelivr.b-cdn.net; style-src 'self' 'unsafe-inline' *; font-src 'self' https://jsdelivr.b-cdn.net; img-src 'self' data: https:; connect-src 'self';">
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
     <meta http-equiv="X-Frame-Options" content="DENY">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta http-equiv="Referrer-Policy" content="strict-origin-when-cross-origin">
     <link rel="stylesheet" href="https://jsdelivr.b-cdn.net/npm/@fortawesome/fontawesome-free@6.0.0/css/all.min.css">
 
@@ -1245,6 +2119,146 @@ header h1 {
     text-align: center;
     max-width: 400px;
     margin: 0 auto;
+}
+
+.auth-container {
+    text-align: center;
+    max-width: 400px;
+    margin: 0 auto;
+}
+
+.login-method-selector {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    border-radius: 8px;
+    background: #f8fafc;
+    padding: 0.25rem;
+}
+
+.method-btn {
+    flex: 1;
+    padding: 0.75rem 1rem;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+}
+
+.method-btn.active {
+    background: #4285f4;
+    color: white;
+    box-shadow: 0 2px 8px rgba(66, 133, 244, 0.3);
+}
+
+.method-btn:hover:not(.active) {
+    background: #e2e8f0;
+    color: #475569;
+}
+
+.auth-form {
+    text-align: left;
+}
+
+.form-group {
+    margin-bottom: 1rem;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 500;
+    color: #374151;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    font-size: 1rem;
+    transition: border-color 0.2s ease;
+    box-sizing: border-box;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: #4285f4;
+    box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.1);
+}
+
+.form-group small {
+    display: block;
+    margin-top: 0.25rem;
+    color: #6b7280;
+    font-size: 0.875rem;
+}
+
+.auth-btn {
+    width: 100%;
+    padding: 0.875rem 1.5rem;
+    background: #4285f4;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    margin: 1rem 0;
+}
+
+.auth-btn:hover {
+    background: #3367d6;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(66, 133, 244, 0.3);
+}
+
+.auth-btn:active {
+    transform: translateY(0);
+}
+
+.auth-link {
+    text-align: center;
+    margin-top: 1rem;
+    color: #6b7280;
+}
+
+.auth-link a {
+    color: #4285f4;
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.auth-link a:hover {
+    text-decoration: underline;
+}
+
+.password-strength {
+    margin-top: 0.5rem;
+}
+
+.password-strength small {
+    color: #6b7280;
+}
+
+.password-strength.weak small {
+    color: #ef4444;
+}
+
+.password-strength.strong small {
+    color: #10b981;
 }
 
 .oauth-login-btn {
@@ -2338,18 +3352,80 @@ header h1 {
         
         <main>
             <div id="loginSection" class="card">
-                <div class="oauth-login-card">
+                <div class="auth-container">
                     <h2>🔐 安全登录</h2>
-                    <p style="color: #6b7280; margin: 1rem 0;">使用第三方授权登录系统</p>
-                    
-		<button onclick="startOAuthLogin()" class="oauth-login-btn">
-		    <span class="oauth-icon">
-		        <img src="https://linux.do/logo-256.svg" 
-		             alt="Logo" 
-		             style="width: 40px; height: 40px; object-fit: contain;">
-		    </span>
-		    <span>使用Linux.do账号登录</span>
-		</button>
+
+                    <!-- 登录方式选择 -->
+                    <div class="login-method-selector" style="margin-bottom: 1.5rem;">
+                        <button id="passwordLoginBtn" class="method-btn active" onclick="showPasswordLogin()">
+                            <i class="fas fa-key"></i>
+                            密码登录
+                        </button>
+                        <button id="oauthLoginBtn" class="method-btn" onclick="showOAuthLogin()">
+                            <i class="fab fa-github"></i>
+                            OAuth登录
+                        </button>
+                    </div>
+
+                    <!-- 密码登录表单 -->
+                    <div id="passwordLoginForm" class="auth-form">
+                        <div class="form-group">
+                            <label for="loginUsername">用户名</label>
+                            <input type="text" id="loginUsername" required autocomplete="username">
+                        </div>
+                        <div class="form-group">
+                            <label for="loginPassword">密码</label>
+                            <input type="password" id="loginPassword" required autocomplete="current-password">
+                        </div>
+                        <button onclick="handlePasswordLogin()" class="auth-btn">
+                            <i class="fas fa-sign-in-alt"></i>
+                            登录
+                        </button>
+                        <p class="auth-link">
+                            还没有账户？<a href="#" onclick="showRegistrationForm()">立即注册</a>
+                        </p>
+                    </div>
+
+                    <!-- OAuth登录表单 -->
+                    <div id="oauthLoginForm" class="auth-form" style="display: none;">
+                        <p style="color: #6b7280; margin: 1rem 0;">使用第三方授权登录系统</p>
+                        <button onclick="startOAuthLogin()" class="oauth-login-btn">
+                            <span class="oauth-icon">
+                                <img src="https://linux.do/logo-256.svg"
+                                     alt="Logo"
+                                     style="width: 40px; height: 40px; object-fit: contain;">
+                            </span>
+                            <span>使用Linux.do账号登录</span>
+                        </button>
+                    </div>
+
+                    <!-- 用户注册表单 -->
+                    <div id="registrationForm" class="auth-form" style="display: none;">
+                        <h3>创建新账户</h3>
+                        <div class="form-group">
+                            <label for="regUsername">用户名</label>
+                            <input type="text" id="regUsername" required autocomplete="username">
+                            <small>3-30个字符，只能包含字母、数字、下划线和连字符</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="regEmail">邮箱</label>
+                            <input type="email" id="regEmail" required autocomplete="email">
+                        </div>
+                        <div class="form-group">
+                            <label for="regPassword">密码</label>
+                            <input type="password" id="regPassword" required autocomplete="new-password">
+                            <div id="passwordStrength" class="password-strength">
+                                <small>密码要求：至少8位，包含大小写字母、数字和特殊字符</small>
+                            </div>
+                        </div>
+                        <button onclick="handleUserRegistration()" class="auth-btn">
+                            <i class="fas fa-user-plus"></i>
+                            注册
+                        </button>
+                        <p class="auth-link">
+                            已有账户？<a href="#" onclick="showPasswordLogin()">立即登录</a>
+                        </p>
+                    </div>
 		
 		<!-- GitHub 开源仓库链接 -->
 		<div class="github-link">
@@ -2365,7 +3441,7 @@ header h1 {
                         <h4 style="margin-bottom: 0.5rem; color: #374151;">🛡️ 安全说明：</h4>
                         <ul style="padding-left: 1.5rem; line-height: 1.6; text-align: left;">
                             <li>使用OAuth 2.0标准授权协议</li>
-                            <li>仅授权用户可以访问系统</li>
+                            <li>支持自动账号创建与绑定</li>
                             <li>会话2小时后自动过期</li>
                             <li>所有操作都有安全日志记录</li>
                         </ul>
@@ -2703,6 +3779,35 @@ header h1 {
             document.getElementById('modal').addEventListener('click', (e) => {
                 if (e.target.id === 'modal') closeModal();
             });
+
+            // 设置密码强度检查
+            setupPasswordStrengthCheck();
+
+            // 设置回车键登录
+            const loginUsername = document.getElementById('loginUsername');
+            const loginPassword = document.getElementById('loginPassword');
+            if (loginUsername && loginPassword) {
+                [loginUsername, loginPassword].forEach(input => {
+                    input.addEventListener('keypress', (e) => {
+                        if (e.key === 'Enter') {
+                            handlePasswordLogin();
+                        }
+                    });
+                });
+            }
+
+            // 设置注册表单回车键
+            const regInputs = ['regUsername', 'regEmail', 'regPassword'];
+            regInputs.forEach(id => {
+                const input = document.getElementById(id);
+                if (input) {
+                    input.addEventListener('keypress', (e) => {
+                        if (e.key === 'Enter') {
+                            handleUserRegistration();
+                        }
+                    });
+                }
+            });
         }
         
         function togglePassword(inputId) {
@@ -2717,6 +3822,192 @@ header h1 {
             }
         }
         
+        // ===== 认证界面切换函数 =====
+        function showPasswordLogin() {
+            document.getElementById('passwordLoginBtn').classList.add('active');
+            document.getElementById('oauthLoginBtn').classList.remove('active');
+            document.getElementById('passwordLoginForm').style.display = 'block';
+            document.getElementById('oauthLoginForm').style.display = 'none';
+            document.getElementById('registrationForm').style.display = 'none';
+        }
+
+        function showOAuthLogin() {
+            document.getElementById('passwordLoginBtn').classList.remove('active');
+            document.getElementById('oauthLoginBtn').classList.add('active');
+            document.getElementById('passwordLoginForm').style.display = 'none';
+            document.getElementById('oauthLoginForm').style.display = 'block';
+            document.getElementById('registrationForm').style.display = 'none';
+        }
+
+        function showRegistrationForm() {
+            document.getElementById('passwordLoginBtn').classList.remove('active');
+            document.getElementById('oauthLoginBtn').classList.remove('active');
+            document.getElementById('passwordLoginForm').style.display = 'none';
+            document.getElementById('oauthLoginForm').style.display = 'none';
+            document.getElementById('registrationForm').style.display = 'block';
+        }
+
+        // ===== 密码登录函数 =====
+        async function handlePasswordLogin() {
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+
+            if (!username || !password) {
+                showFloatingMessage('❌ 请输入用户名和密码', 'error');
+                return;
+            }
+
+            try {
+                showFloatingMessage('🔄 正在登录...', 'warning');
+
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        username: username,
+                        password: password
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    authToken = data.token;
+                    userInfo = data.userInfo;
+                    loginTime = Date.now();
+
+                    localStorage.setItem('authToken', authToken);
+                    localStorage.setItem('userInfo', JSON.stringify(userInfo));
+                    localStorage.setItem('loginTime', loginTime);
+
+                    showMainSection();
+                    refreshAccounts();
+                    startSessionTimer();
+                    showFloatingMessage('✅ 登录成功！', 'success');
+                } else {
+                    showFloatingMessage('❌ 登录失败：' + (data.error || '未知错误'), 'error');
+                    if (data.lockedUntil) {
+                        showFloatingMessage('🔒 账户已被锁定，请稍后再试', 'error');
+                    }
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                showFloatingMessage('❌ 登录失败：网络错误', 'error');
+            }
+        }
+
+        // ===== 用户注册函数 =====
+        async function handleUserRegistration() {
+            const username = document.getElementById('regUsername').value.trim();
+            const email = document.getElementById('regEmail').value.trim();
+            const password = document.getElementById('regPassword').value;
+
+            if (!username || !email || !password) {
+                showFloatingMessage('❌ 请填写所有必填字段', 'error');
+                return;
+            }
+
+            // 前端密码强度检查
+            const passwordCheck = validatePasswordStrengthClient(password);
+            if (!passwordCheck.isValid) {
+                showFloatingMessage('❌ 密码不符合安全要求', 'error');
+                return;
+            }
+
+            try {
+                showFloatingMessage('🔄 正在注册...', 'warning');
+
+                const response = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        username: username,
+                        email: email,
+                        password: password
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    showFloatingMessage('✅ 注册成功！请登录', 'success');
+                    showPasswordLogin();
+                    // 清空注册表单
+                    document.getElementById('regUsername').value = '';
+                    document.getElementById('regEmail').value = '';
+                    document.getElementById('regPassword').value = '';
+                    // 填入用户名到登录表单
+                    document.getElementById('loginUsername').value = username;
+                } else {
+                    showFloatingMessage('❌ 注册失败：' + (data.error || '未知错误'), 'error');
+                }
+            } catch (error) {
+                console.error('Registration error:', error);
+                showFloatingMessage('❌ 注册失败：网络错误', 'error');
+            }
+        }
+
+        // ===== 密码强度验证（前端） =====
+        function validatePasswordStrengthClient(password) {
+            if (!password || typeof password !== 'string') {
+                return { isValid: false, requirements: {} };
+            }
+
+            const minLength = 8;
+            const hasUpper = /[A-Z]/.test(password);
+            const hasLower = /[a-z]/.test(password);
+            // 使用兼容性更好的数字检测方法
+            const hasNumber = /[0-9]/.test(password);
+            const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+
+            const requirements = {
+                length: password.length >= minLength,
+                uppercase: hasUpper,
+                lowercase: hasLower,
+                number: hasNumber,
+                special: hasSpecial
+            };
+
+            return {
+                isValid: requirements.length && requirements.uppercase && requirements.lowercase && requirements.number && requirements.special,
+                requirements: requirements
+            };
+        }
+
+        // ===== 实时密码强度检查 =====
+        function setupPasswordStrengthCheck() {
+            const passwordInput = document.getElementById('regPassword');
+            const strengthDiv = document.getElementById('passwordStrength');
+
+            if (passwordInput && strengthDiv) {
+                passwordInput.addEventListener('input', function() {
+                    const password = this.value;
+                    const check = validatePasswordStrengthClient(password);
+
+                    if (password.length === 0) {
+                        strengthDiv.className = 'password-strength';
+                        strengthDiv.innerHTML = '<small>密码要求：至少8位，包含大小写字母、数字和特殊字符</small>';
+                    } else if (check.isValid) {
+                        strengthDiv.className = 'password-strength strong';
+                        strengthDiv.innerHTML = '<small>✅ 密码强度良好</small>';
+                    } else {
+                        strengthDiv.className = 'password-strength weak';
+                        const missing = [];
+                        if (!check.requirements.length) missing.push('至少8位');
+                        if (!check.requirements.uppercase) missing.push('大写字母');
+                        if (!check.requirements.lowercase) missing.push('小写字母');
+                        if (!check.requirements.number) missing.push('数字');
+                        if (!check.requirements.special) missing.push('特殊字符');
+                        strengthDiv.innerHTML = '<small>缺少: ' + missing.join(', ') + '</small>';
+                    }
+                });
+            }
+        }
+
         function startOAuthLogin() {
             showFloatingMessage('🔄 正在跳转到授权页面...', 'warning');
             window.location.href = '/api/oauth/authorize';
@@ -4486,16 +5777,18 @@ async function handleImport(request, env) {
             });
         }
         
-        const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+        // 使用用户隔离的存储key
+        const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+        const encryptedData = await env.USER_DATA.get(userAccountsKey);
         let existingAccounts = [];
-        
+
         if (encryptedData) {
             try {
                 const parsed = JSON.parse(encryptedData);
                 existingAccounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
             } catch (decryptError) {
-                const legacyData = await env.USER_DATA.get('accounts');
-                existingAccounts = legacyData ? JSON.parse(legacyData) : [];
+                console.error('Failed to decrypt user accounts for import:', decryptError);
+                existingAccounts = [];
             }
         }
         
@@ -4515,13 +5808,14 @@ async function handleImport(request, env) {
         }
         
         const encrypted = await encryptData(allAccounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-        await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-        
-        await logSecurityEvent('IMPORT_SUCCESS', { 
-            type, 
+        await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+        await logSecurityEvent('IMPORT_SUCCESS', {
+            type,
             totalImported: validAccounts.length,
             actuallyAdded: addedCount,
-            duplicatesSkipped: validAccounts.length - addedCount
+            duplicatesSkipped: validAccounts.length - addedCount,
+            userId: authenticatedUser.id
         }, request);
         
         return new Response(JSON.stringify({
@@ -4561,29 +5855,48 @@ async function handleAccounts(request, env) {
     
     if (request.method === 'GET') {
         try {
-            const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+            // 使用用户隔离的存储key
+            const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+            const encryptedData = await env.USER_DATA.get(userAccountsKey);
             let accounts = [];
-            
+
             if (encryptedData) {
                 try {
                     const parsed = JSON.parse(encryptedData);
                     accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
                 } catch (decryptError) {
-                    console.error('Decryption failed, trying legacy format:', decryptError);
-                    const legacyData = await env.USER_DATA.get('accounts');
-                    accounts = legacyData ? JSON.parse(legacyData) : [];
+                    console.error('Decryption failed for user accounts:', decryptError);
+                    // 对于OAuth用户，尝试从旧的存储格式迁移
+                    if (authenticatedUser.loginMethod === 'oauth') {
+                        const legacyData = await env.USER_DATA.get('accounts_encrypted');
+                        if (legacyData) {
+                            try {
+                                const parsed = JSON.parse(legacyData);
+                                accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
+                                // 迁移到用户隔离存储
+                                const encrypted = await encryptData(accounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
+                                await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+                                console.log(`Migrated accounts for user ${authenticatedUser.id}`);
+                            } catch (migrationError) {
+                                console.error('Failed to migrate legacy accounts:', migrationError);
+                            }
+                        }
+                    }
                 }
             }
-            
+
             return new Response(JSON.stringify({ accounts }), {
                 status: 200,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' }
             });
         } catch (error) {
-            await logSecurityEvent('ACCOUNTS_READ_ERROR', { error: error.message }, request);
-            return new Response(JSON.stringify({ 
+            await logSecurityEvent('ACCOUNTS_READ_ERROR', {
+                error: error.message,
+                userId: authenticatedUser.id
+            }, request);
+            return new Response(JSON.stringify({
                 error: 'Failed to load accounts',
-                message: error.message 
+                message: error.message
             }), {
                 status: 500,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -4623,16 +5936,18 @@ async function handleAccounts(request, env) {
                 });
             }
             
-            const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+            // 使用用户隔离的存储key
+            const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+            const encryptedData = await env.USER_DATA.get(userAccountsKey);
             let accounts = [];
-            
+
             if (encryptedData) {
                 try {
                     const parsed = JSON.parse(encryptedData);
                     accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
                 } catch (decryptError) {
-                    const legacyData = await env.USER_DATA.get('accounts');
-                    accounts = legacyData ? JSON.parse(legacyData) : [];
+                    console.error('Failed to decrypt user accounts:', decryptError);
+                    accounts = [];
                 }
             }
             
@@ -4661,13 +5976,15 @@ async function handleAccounts(request, env) {
             };
             
             accounts.push(newAccount);
-            
+
+            // 保存到用户隔离的存储
             const encrypted = await encryptData(accounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-            await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-            
-            await logSecurityEvent('ACCOUNT_ADDED', { 
-                service: newAccount.service, 
-                account: newAccount.account 
+            await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+            await logSecurityEvent('ACCOUNT_ADDED', {
+                service: newAccount.service,
+                account: newAccount.account,
+                userId: authenticatedUser.id
             }, request);
             
             return new Response(JSON.stringify({
@@ -4717,25 +6034,26 @@ async function handleClearAllAccounts(request, env) {
     }
     
     try {
-        const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+        // 使用用户隔离的存储key
+        const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+        const encryptedData = await env.USER_DATA.get(userAccountsKey);
         let currentCount = 0;
-        
+
         if (encryptedData) {
             try {
                 const parsed = JSON.parse(encryptedData);
                 const accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
                 currentCount = accounts.length;
             } catch (decryptError) {
-                const legacyData = await env.USER_DATA.get('accounts');
-                const accounts = legacyData ? JSON.parse(legacyData) : [];
-                currentCount = accounts.length;
+                console.error('Failed to decrypt user accounts for clearing:', decryptError);
+                currentCount = 0;
             }
         }
-        
+
+        // 清空用户的账户数据
         const emptyAccounts = [];
         const encrypted = await encryptData(emptyAccounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-        await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-        await env.USER_DATA.delete('accounts');
+        await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
         
         await logSecurityEvent('ALL_ACCOUNTS_CLEARED', { 
             previousCount: currentCount,
@@ -4798,16 +6116,18 @@ async function handleAccountUpdate(request, env, accountId) {
                 });
             }
             
-            const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+            // 使用用户隔离的存储key
+            const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+            const encryptedData = await env.USER_DATA.get(userAccountsKey);
             let accounts = [];
-            
+
             if (encryptedData) {
                 try {
                     const parsed = JSON.parse(encryptedData);
                     accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
                 } catch (decryptError) {
-                    const legacyData = await env.USER_DATA.get('accounts');
-                    accounts = legacyData ? JSON.parse(legacyData) : [];
+                    console.error('Failed to decrypt user accounts for update:', decryptError);
+                    accounts = [];
                 }
             }
             
@@ -4830,12 +6150,13 @@ async function handleAccountUpdate(request, env, accountId) {
             };
             
             const encrypted = await encryptData(accounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-            await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-            
-            await logSecurityEvent('ACCOUNT_UPDATED', { 
+            await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+            await logSecurityEvent('ACCOUNT_UPDATED', {
                 accountId,
-                service: accounts[accountIndex].service, 
-                account: accounts[accountIndex].account 
+                service: accounts[accountIndex].service,
+                account: accounts[accountIndex].account,
+                userId: authenticatedUser.id
             }, request);
             
             return new Response(JSON.stringify({
@@ -4859,35 +6180,38 @@ async function handleAccountUpdate(request, env, accountId) {
     
     if (request.method === 'DELETE') {
         try {
-            const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+            // 使用用户隔离的存储key
+            const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+            const encryptedData = await env.USER_DATA.get(userAccountsKey);
             let accounts = [];
-            
+
             if (encryptedData) {
                 try {
                     const parsed = JSON.parse(encryptedData);
                     accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
                 } catch (decryptError) {
-                    const legacyData = await env.USER_DATA.get('accounts');
-                    accounts = legacyData ? JSON.parse(legacyData) : [];
+                    console.error('Failed to decrypt user accounts for deletion:', decryptError);
+                    accounts = [];
                 }
             }
-            
+
             const accountToDelete = accounts.find(acc => acc.id === accountId);
             const filteredAccounts = accounts.filter(acc => acc.id !== accountId);
-            
+
             if (filteredAccounts.length === accounts.length) {
                 return new Response(JSON.stringify({ error: 'Account not found' }), {
                     status: 404,
                     headers: { ...corsHeaders, 'Content-Type': 'application/json' }
                 });
             }
-            
+
             const encrypted = await encryptData(filteredAccounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-            await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-            
-            await logSecurityEvent('ACCOUNT_DELETED', { 
-                service: accountToDelete?.service, 
-                account: accountToDelete?.account 
+            await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+            await logSecurityEvent('ACCOUNT_DELETED', {
+                service: accountToDelete?.service,
+                account: accountToDelete?.account,
+                userId: authenticatedUser.id
             }, request);
             
             return new Response(JSON.stringify({
@@ -5056,19 +6380,21 @@ async function handleAddFromURI(request, env) {
             });
         }
         
-        const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+        // 使用用户隔离的存储key
+        const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+        const encryptedData = await env.USER_DATA.get(userAccountsKey);
         let accounts = [];
-        
+
         if (encryptedData) {
             try {
                 const parsed = JSON.parse(encryptedData);
                 accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
             } catch (decryptError) {
-                const legacyData = await env.USER_DATA.get('accounts');
-                accounts = legacyData ? JSON.parse(legacyData) : [];
+                console.error('Failed to decrypt user accounts for URI add:', decryptError);
+                accounts = [];
             }
         }
-        
+
         const newAccount = {
             id: crypto.randomUUID(),
             service: parsedAccount.issuer || 'Unknown Service',
@@ -5080,14 +6406,15 @@ async function handleAddFromURI(request, env) {
             createdAt: Date.now(),
             createdBy: authenticatedUser.username || authenticatedUser.id
         };
-        
+
         accounts.push(newAccount);
         const encrypted = await encryptData(accounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-        await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-        
-        await logSecurityEvent('ACCOUNT_ADDED_FROM_QR', { 
-            service: newAccount.service, 
-            account: newAccount.account 
+        await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+        await logSecurityEvent('ACCOUNT_ADDED_FROM_QR', {
+            service: newAccount.service,
+            account: newAccount.account,
+            userId: authenticatedUser.id
         }, request);
         
         return new Response(JSON.stringify({
@@ -5516,16 +6843,18 @@ async function handleSecureExport(request, env) {
             });
         }
         
-        const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+        // 使用用户隔离的存储key
+        const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+        const encryptedData = await env.USER_DATA.get(userAccountsKey);
         let accounts = [];
-        
+
         if (encryptedData) {
             try {
                 const parsed = JSON.parse(encryptedData);
                 accounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
             } catch (decryptError) {
-                const legacyData = await env.USER_DATA.get('accounts');
-                accounts = legacyData ? JSON.parse(legacyData) : [];
+                console.error('Failed to decrypt user accounts for export:', decryptError);
+                accounts = [];
             }
         }
         
@@ -5659,16 +6988,18 @@ async function handleSecureImport(request, env) {
             });
         }
         
-        const encryptedData = await env.USER_DATA.get('accounts_encrypted');
+        // 使用用户隔离的存储key
+        const userAccountsKey = STORAGE_KEYS.USER_ACCOUNTS.replace('{userId}', authenticatedUser.id);
+        const encryptedData = await env.USER_DATA.get(userAccountsKey);
         let existingAccounts = [];
-        
+
         if (encryptedData) {
             try {
                 const parsed = JSON.parse(encryptedData);
                 existingAccounts = await decryptData(parsed, env.ENCRYPTION_KEY || env.JWT_SECRET);
             } catch (decryptError) {
-                const legacyData = await env.USER_DATA.get('accounts');
-                existingAccounts = legacyData ? JSON.parse(legacyData) : [];
+                console.error('Failed to decrypt user accounts for secure import:', decryptError);
+                existingAccounts = [];
             }
         }
         
@@ -5688,12 +7019,13 @@ async function handleSecureImport(request, env) {
         }
         
         const encrypted = await encryptData(allAccounts, env.ENCRYPTION_KEY || env.JWT_SECRET);
-        await env.USER_DATA.put('accounts_encrypted', JSON.stringify(encrypted));
-        
-        await logSecurityEvent('SECURE_IMPORT_SUCCESS', { 
+        await env.USER_DATA.put(userAccountsKey, JSON.stringify(encrypted));
+
+        await logSecurityEvent('SECURE_IMPORT_SUCCESS', {
             totalImported: validAccounts.length,
             actuallyAdded: addedCount,
-            duplicatesSkipped: validAccounts.length - addedCount
+            duplicatesSkipped: validAccounts.length - addedCount,
+            userId: authenticatedUser.id
         }, request);
         
         return new Response(JSON.stringify({
@@ -5737,8 +7069,8 @@ async function handleGetWebDAVConfigs(request, env) {
     }
     
     try {
-        const configs = await loadWebDAVConfigsFromKV(env);
-        
+        const configs = await loadWebDAVConfigsFromKV(env, authenticatedUser.id);
+
         return new Response(JSON.stringify({
             success: true,
             configs: configs
@@ -5797,10 +7129,13 @@ async function handleSaveWebDAVConfigs(request, env) {
             }
         }
         
-        const success = await saveWebDAVConfigToKV(configs, env);
-        
+        const success = await saveWebDAVConfigsToKV(configs, env, authenticatedUser.id);
+
         if (success) {
-            await logSecurityEvent('WEBDAV_CONFIGS_SAVED', { count: configs.length }, request);
+            await logSecurityEvent('WEBDAV_CONFIGS_SAVED', {
+                count: configs.length,
+                userId: authenticatedUser.id
+            }, request);
             
             return new Response(JSON.stringify({
                 success: true,
@@ -5849,6 +7184,10 @@ export default {
                 });
             }
             
+            // 认证相关路由
+            if (path === '/api/auth/register') return await handleUserRegistration(request, env);
+            if (path === '/api/auth/login') return await handlePasswordLogin(request, env);
+            if (path === '/api/auth/migrate') return await handleDataMigration(request, env);
             if (path === '/api/oauth/authorize') return await handleOAuthAuthorize(request, env);
             if (path === '/api/oauth/callback') return await handleOAuthCallback(request, env);
             if (path === '/api/accounts') return await handleAccounts(request, env);
