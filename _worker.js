@@ -313,6 +313,38 @@ async function updateLastLogin(userId, env) {
     }
 }
 
+// 更新用户的OAuth绑定状态
+async function updateUserOAuthBinding(userId, oauthId, env) {
+    try {
+        const users = await getUsersRegistry(env);
+        if (!users[userId]) {
+            throw new Error('User not found');
+        }
+
+        // 检查OAuth ID是否已被其他用户绑定
+        const existingUser = await findUserByOAuthId(oauthId, env);
+        if (existingUser && existingUser.id !== userId) {
+            throw new Error('OAuth ID already bound to another user');
+        }
+
+        // 更新用户的OAuth绑定信息
+        users[userId].oauthId = oauthId;
+
+        // 如果用户的登录方式中没有oauth，则添加
+        if (!users[userId].loginMethods.includes('oauth')) {
+            users[userId].loginMethods.push('oauth');
+        }
+
+        // 保存更新后的用户信息
+        await saveUsersRegistry(users, env);
+
+        return true;
+    } catch (error) {
+        console.error('Failed to update OAuth binding:', error);
+        throw error;
+    }
+}
+
 async function incrementFailedAttempts(userId, env) {
     const users = await getUsersRegistry(env);
     if (users[userId]) {
@@ -1195,6 +1227,69 @@ async function handleDataMigration(request, env) {
     }
 }
 
+// ===== 用户信息API =====
+async function handleUserProfile(request, env) {
+    const corsHeaders = getCorsHeaders(request, env);
+
+    if (request.method !== 'GET') {
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    // 验证用户身份
+    const authenticatedUser = await getAuthenticatedUser(request, env);
+    if (!authenticatedUser) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    try {
+        // 获取完整的用户信息
+        const user = await findUserById(authenticatedUser.id, env);
+        if (!user) {
+            return new Response(JSON.stringify({ error: 'User not found' }), {
+                status: 404,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 构建用户资料响应
+        const userProfile = {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            createdAt: user.createdAt,
+            lastLoginAt: user.lastLoginAt,
+            loginMethods: user.loginMethods,
+            hasOAuthBinding: !!user.oauthId,
+            oauthInfo: user.oauthId ? {
+                id: user.oauthId
+            } : null
+        };
+
+        return new Response(JSON.stringify({
+            success: true,
+            profile: userProfile
+        }), {
+            status: 200,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        console.error('User profile error:', error);
+        return new Response(JSON.stringify({
+            error: 'Failed to retrieve user profile',
+            message: error.message
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 // ===== 密码登录API =====
 async function handlePasswordLogin(request, env) {
     const corsHeaders = {
@@ -1556,33 +1651,328 @@ function getCorsHeaders(request, env) {
     };
 }
 
-// ===== OAuth授权URL构建 =====
+// ===== OAuth授权URL构建（统一登录和绑定） =====
 async function handleOAuthAuthorize(request, env) {
+    const corsHeaders = getCorsHeaders(request, env);
+
     if (request.method !== 'GET') {
         return new Response('Method not allowed', { status: 405 });
     }
-    
+
     try {
-        const state = crypto.randomUUID();
-        const params = new URLSearchParams({
-            response_type: 'code',
-            client_id: env.OAUTH_CLIENT_ID,
-            redirect_uri: env.OAUTH_REDIRECT_URI,
-            state: state
-        });
-        
-        const authUrl = `${env.OAUTH_BASE_URL}/oauth2/authorize?${params}`;
-        
-        return new Response(null, {
-            status: 302,
-            headers: {
-                'Location': authUrl,
-                'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
+        const url = new URL(request.url);
+        const action = url.searchParams.get('action');
+
+        // 检查是否为绑定操作
+        if (action === 'bind') {
+            // 绑定操作需要用户已登录，从cookie中获取用户信息
+            const cookieHeader = request.headers.get('Cookie');
+            let bindUserData = null;
+
+            if (cookieHeader) {
+                const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+                    const [key, value] = cookie.trim().split('=');
+                    acc[key] = value;
+                    return acc;
+                }, {});
+
+                if (cookies.oauth_bind_user) {
+                    try {
+                        bindUserData = JSON.parse(decodeURIComponent(cookies.oauth_bind_user));
+                    } catch (e) {
+                        console.error('Failed to parse bind user data:', e);
+                    }
+                }
             }
-        });
+
+            if (!bindUserData || !bindUserData.userId) {
+                return new Response(JSON.stringify({
+                    error: 'Unauthorized',
+                    message: '请先登录后再进行绑定操作'
+                }), {
+                    status: 401,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 检查cookie是否过期（10分钟）
+            if (Date.now() - bindUserData.timestamp > 10 * 60 * 1000) {
+                return new Response(JSON.stringify({
+                    error: 'Session expired',
+                    message: '绑定会话已过期，请重新尝试'
+                }), {
+                    status: 401,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 获取用户信息
+            const authenticatedUser = await findUserById(bindUserData.userId, env);
+            if (!authenticatedUser) {
+                return new Response(JSON.stringify({
+                    error: 'User not found',
+                    message: '用户不存在'
+                }), {
+                    status: 404,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 检查用户是否使用密码登录
+            if (authenticatedUser.loginMethods && !authenticatedUser.loginMethods.includes('password')) {
+                return new Response(JSON.stringify({
+                    error: 'Invalid operation',
+                    message: '只有密码登录用户可以绑定OAuth账号'
+                }), {
+                    status: 400,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 检查用户是否已经绑定了OAuth账号
+            if (authenticatedUser.oauthId) {
+                return new Response(JSON.stringify({
+                    error: 'Already bound',
+                    message: '您的账号已经绑定了OAuth账号'
+                }), {
+                    status: 400,
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 创建带绑定标识的state
+            const bindingState = {
+                type: 'bind',
+                userId: authenticatedUser.id,
+                timestamp: Date.now(),
+                nonce: crypto.randomUUID()
+            };
+
+            // 加密state数据
+            const stateString = JSON.stringify(bindingState);
+            const stateToken = await encryptStateToken(stateString, env.JWT_SECRET);
+
+            // 构建OAuth授权URL
+            const params = new URLSearchParams({
+                response_type: 'code',
+                client_id: env.OAUTH_CLIENT_ID,
+                redirect_uri: env.OAUTH_REDIRECT_URI,
+                state: stateToken
+            });
+
+            const authUrl = `${env.OAUTH_BASE_URL}/oauth2/authorize?${params}`;
+
+            // 记录绑定尝试
+            await logSecurityEvent('OAUTH_BIND_ATTEMPT', {
+                userId: authenticatedUser.id,
+                username: authenticatedUser.username
+            }, request);
+
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    'Location': authUrl,
+                    'Set-Cookie': `oauth_bind_state=${stateToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
+                }
+            });
+        } else {
+            // 默认登录操作
+            const state = crypto.randomUUID();
+            const params = new URLSearchParams({
+                response_type: 'code',
+                client_id: env.OAUTH_CLIENT_ID,
+                redirect_uri: env.OAUTH_REDIRECT_URI,
+                state: state
+            });
+
+            const authUrl = `${env.OAUTH_BASE_URL}/oauth2/authorize?${params}`;
+
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    'Location': authUrl,
+                    'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
+                }
+            });
+        }
     } catch (error) {
         console.error('OAuth authorize error:', error);
-        return new Response(`OAuth configuration error: ${error.message}`, { status: 500 });
+        await logSecurityEvent('OAUTH_ERROR', { error: error.message }, request);
+
+        return new Response(JSON.stringify({
+            error: 'OAuth configuration error',
+            message: error.message
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// ===== OAuth绑定解除 =====
+async function handleOAuthUnbind(request, env) {
+    const corsHeaders = getCorsHeaders(request, env);
+
+    if (request.method !== 'DELETE') {
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    // 验证用户身份
+    const authenticatedUser = await getAuthenticatedUser(request, env);
+    if (!authenticatedUser) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+
+    try {
+        // 获取用户信息
+        const user = await findUserById(authenticatedUser.id, env);
+        if (!user) {
+            return new Response(JSON.stringify({ error: 'User not found' }), {
+                status: 404,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查用户是否已绑定OAuth
+        if (!user.oauthId) {
+            return new Response(JSON.stringify({
+                error: 'Not bound',
+                message: '您的账号尚未绑定OAuth账号'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查用户是否只有OAuth登录方式
+        if (user.loginMethods.length === 1 && user.loginMethods[0] === 'oauth') {
+            return new Response(JSON.stringify({
+                error: 'Cannot unbind',
+                message: '您的账号只有OAuth登录方式，无法解除绑定'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 解除绑定
+        const users = await getUsersRegistry(env);
+        users[user.id].oauthId = null;
+
+        // 从登录方式中移除oauth
+        users[user.id].loginMethods = users[user.id].loginMethods.filter(method => method !== 'oauth');
+
+        // 保存更新后的用户信息
+        await saveUsersRegistry(users, env);
+
+        // 记录解绑操作
+        await logSecurityEvent('OAUTH_UNBIND', {
+            userId: user.id,
+            username: user.username
+        }, request);
+
+        return new Response(JSON.stringify({
+            success: true,
+            message: 'OAuth账号解绑成功'
+        }), {
+            status: 200,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        console.error('OAuth unbind error:', error);
+        return new Response(JSON.stringify({
+            error: 'Failed to unbind OAuth account',
+            message: error.message
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+
+
+// 加密state令牌
+async function encryptStateToken(stateData, secret) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(stateData);
+
+    // 使用JWT_SECRET作为密钥
+    const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+
+    // 签名state数据
+    const signature = await crypto.subtle.sign(
+        'HMAC',
+        key,
+        data
+    );
+
+    // 创建安全的state令牌
+    const base64Data = btoa(String.fromCharCode(...new Uint8Array(data)));
+    const base64Signature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+
+    return `${base64Data}.${base64Signature}`;
+}
+
+// 解密并验证state令牌
+async function decryptStateToken(stateToken, secret) {
+    try {
+        const [base64Data, base64Signature] = stateToken.split('.');
+        if (!base64Data || !base64Signature) {
+            throw new Error('Invalid state token format');
+        }
+
+        const encoder = new TextEncoder();
+        const data = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+        const signature = Uint8Array.from(atob(base64Signature), c => c.charCodeAt(0));
+
+        // 使用JWT_SECRET作为密钥
+        const key = await crypto.subtle.importKey(
+            'raw',
+            encoder.encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['verify']
+        );
+
+        // 验证签名
+        const isValid = await crypto.subtle.verify(
+            'HMAC',
+            key,
+            signature,
+            data
+        );
+
+        if (!isValid) {
+            throw new Error('Invalid state token signature');
+        }
+
+        // 解析state数据
+        const decoder = new TextDecoder();
+        const stateData = JSON.parse(decoder.decode(data));
+
+        // 检查时间戳（10分钟有效期）
+        const now = Date.now();
+        if (now - stateData.timestamp > 10 * 60 * 1000) {
+            throw new Error('State token expired');
+        }
+
+        return stateData;
+    } catch (error) {
+        console.error('State token validation error:', error);
+        throw new Error(`State validation failed: ${error.message}`);
     }
 }
 
@@ -1636,13 +2026,24 @@ async function handleOAuthCallback(request, env) {
             if (!code || !state) {
                 await recordOAuthAttempt(clientIP, false);
                 await logSecurityEvent('OAUTH_FAILED', 'Missing code or state in POST request', request);
-                
+
                 return new Response(JSON.stringify({ error: 'Missing code or state parameters' }), {
                     status: 400,
                     headers: { ...corsHeaders, 'Content-Type': 'application/json' }
                 });
             }
-            
+
+            // 检查是否为绑定模式
+            try {
+                const stateData = await decryptStateToken(state, env.JWT_SECRET);
+                if (stateData.type === 'bind') {
+                    return await processOAuthBindCallback(code, state, clientIP, request, env, corsHeaders);
+                }
+            } catch (error) {
+                // 如果state解析失败，继续按普通登录处理
+                console.log('State token parsing failed, treating as normal login:', error.message);
+            }
+
             return await processOAuthCode(code, state, clientIP, request, env, corsHeaders);
         }
     } catch (error) {
@@ -1702,27 +2103,27 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
         if (!code || !state || typeof code !== 'string' || typeof state !== 'string') {
             await recordOAuthAttempt(clientIP, false);
             await logSecurityEvent('OAUTH_FAILED', 'Invalid parameters', request);
-            
+
             return new Response(JSON.stringify({ error: 'Invalid OAuth parameters' }), {
                 status: 400,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' }
             });
         }
-        
+
         // 验证state参数
         const cookies = request.headers.get('Cookie') || '';
         const stateCookie = cookies.split(';').find(c => c.trim().startsWith('oauth_state='))?.split('=')[1];
-        
+
         if (state !== stateCookie) {
             await recordOAuthAttempt(clientIP, false);
             await logSecurityEvent('OAUTH_FAILED', 'State mismatch', request);
-            
+
             return new Response(JSON.stringify({ error: 'Invalid state parameter' }), {
                 status: 400,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' }
             });
         }
-        
+
         // 获取访问令牌
         const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth2/token`, {
             method: 'POST',
@@ -1739,17 +2140,17 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
                 redirect_uri: env.OAUTH_REDIRECT_URI
             })
         });
-        
+
         if (!tokenResponse.ok) {
             const errorText = await tokenResponse.text();
             throw new OAuthError(`Token exchange failed: ${tokenResponse.status} - ${errorText}`, 'TOKEN_EXCHANGE_FAILED');
         }
-        
+
         const tokenData = await tokenResponse.json();
         if (!tokenData.access_token) {
             throw new OAuthError('No access token received', 'NO_ACCESS_TOKEN');
         }
-        
+
         // 获取用户信息
         const userData = await fetchOAuthUser(tokenData.access_token, env.OAUTH_BASE_URL);
 
@@ -1808,7 +2209,7 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
 
         // 生成JWT令牌
         const token = await generateAuthJWT(oauthUser, 'oauth', env.JWT_SECRET);
-        
+
         await recordOAuthAttempt(clientIP, true);
         await logSecurityEvent('OAUTH_SUCCESS', {
             userId: oauthUser.id,
@@ -1829,8 +2230,8 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
             message: 'OAuth login successful'
         }), {
             status: 200,
-            headers: { 
-                ...corsHeaders, 
+            headers: {
+                ...corsHeaders,
                 'Content-Type': 'application/json',
                 'Set-Cookie': 'oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'
             }
@@ -1838,6 +2239,203 @@ async function processOAuthCode(code, state, clientIP, request, env, corsHeaders
     } catch (error) {
         console.error('Process OAuth code error:', error);
         throw error;
+    }
+}
+
+// OAuth绑定回调处理
+async function processOAuthBindCallback(code, state, clientIP, request, env, corsHeaders) {
+    try {
+        if (!code || !state || typeof code !== 'string' || typeof state !== 'string') {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_FAILED', 'Invalid parameters', request);
+
+            return new Response(JSON.stringify({ error: 'Invalid OAuth parameters' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 验证state令牌
+        let stateData;
+        try {
+            stateData = await decryptStateToken(state, env.JWT_SECRET);
+            if (stateData.type !== 'bind') {
+                throw new Error('Not a binding state token');
+            }
+        } catch (error) {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_FAILED', {
+                error: `Invalid state token: ${error.message}`
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'Invalid binding state',
+                message: '绑定请求无效或已过期，请重新尝试'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 对于绑定请求，验证用户身份（从state中获取用户ID，无需Authorization头）
+        // 检查用户是否仍然存在且有效
+        const bindingUser = await findUserById(stateData.userId, env);
+        if (!bindingUser) {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_USER_NOT_FOUND', {
+                stateUserId: stateData.userId
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'User not found',
+                message: '绑定的用户不存在，请重新登录后再尝试绑定'
+            }), {
+                status: 404,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 获取访问令牌
+        const tokenResponse = await fetch(`${env.OAUTH_BASE_URL}/oauth2/token`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+                'User-Agent': '2FA-Manager/1.0'
+            },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                client_id: env.OAUTH_CLIENT_ID,
+                client_secret: env.OAUTH_CLIENT_SECRET,
+                code: code,
+                redirect_uri: env.OAUTH_REDIRECT_URI
+            })
+        });
+
+        if (!tokenResponse.ok) {
+            const errorText = await tokenResponse.text();
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_TOKEN_FAILED', {
+                status: tokenResponse.status,
+                error: errorText
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'OAuth token exchange failed',
+                message: 'OAuth授权失败，请重新尝试'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const tokenData = await tokenResponse.json();
+        if (!tokenData.access_token) {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_NO_TOKEN', {}, request);
+
+            return new Response(JSON.stringify({
+                error: 'No access token received',
+                message: 'OAuth授权失败，请重新尝试'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 获取OAuth用户信息
+        const oauthUserData = await fetchOAuthUser(tokenData.access_token, env.OAUTH_BASE_URL);
+
+        if (!oauthUserData.id) {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_INVALID_USER', {
+                error: 'Missing user ID from OAuth provider'
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'Invalid OAuth user data',
+                message: 'OAuth用户信息无效，请重新尝试'
+            }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 检查OAuth账号是否已被其他用户绑定
+        const existingOAuthUser = await findUserByOAuthId(oauthUserData.id, env);
+        if (existingOAuthUser && existingOAuthUser.id !== bindingUser.id) {
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_CONFLICT', {
+                oauthId: oauthUserData.id,
+                existingUserId: existingOAuthUser.id,
+                attemptUserId: bindingUser.id
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'OAuth account already bound',
+                message: '该OAuth账号已被其他用户绑定，无法重复绑定'
+            }), {
+                status: 409,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 执行绑定操作
+        try {
+            await updateUserOAuthBinding(bindingUser.id, oauthUserData.id.toString(), env);
+
+            await recordOAuthAttempt(clientIP, true);
+            await logSecurityEvent('OAUTH_BIND_SUCCESS', {
+                userId: bindingUser.id,
+                username: bindingUser.username,
+                oauthId: oauthUserData.id,
+                oauthUsername: oauthUserData.username
+            }, request);
+
+            return new Response(JSON.stringify({
+                success: true,
+                message: 'OAuth账号绑定成功',
+                oauthInfo: {
+                    id: oauthUserData.id,
+                    username: oauthUserData.username,
+                    email: oauthUserData.email
+                }
+            }), {
+                status: 200,
+                headers: {
+                    ...corsHeaders,
+                    'Content-Type': 'application/json',
+                    'Set-Cookie': 'oauth_bind_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'
+                }
+            });
+        } catch (error) {
+            console.error('OAuth binding failed:', error);
+            await recordOAuthAttempt(clientIP, false);
+            await logSecurityEvent('OAUTH_BIND_ERROR', {
+                userId: bindingUser.id,
+                error: error.message
+            }, request);
+
+            return new Response(JSON.stringify({
+                error: 'Binding operation failed',
+                message: '绑定操作失败，请重新尝试'
+            }), {
+                status: 500,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+    } catch (error) {
+        console.error('Process OAuth bind callback error:', error);
+        await recordOAuthAttempt(clientIP, false);
+        await logSecurityEvent('OAUTH_BIND_ERROR', { error: error.message }, request);
+
+        return new Response(JSON.stringify({
+            error: 'OAuth binding failed',
+            message: '绑定过程中发生错误，请重新尝试'
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
     }
 }
 
@@ -1961,6 +2559,117 @@ header h1 {
 .user-email {
     font-size: 0.75rem;
     color: rgba(255, 255, 255, 0.8);
+}
+
+/* 用户设置页面样式 */
+.user-profile-section, .login-methods-section, .security-section {
+    margin-bottom: 2rem;
+    padding: 1.5rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.profile-info {
+    display: grid;
+    gap: 1rem;
+    margin-top: 1rem;
+}
+
+.profile-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.profile-item label {
+    font-weight: 600;
+    color: #e5e7eb;
+}
+
+.profile-item span {
+    color: #9ca3af;
+}
+
+.login-methods {
+    margin-top: 1rem;
+}
+
+.method-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem;
+    margin-bottom: 0.75rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.method-info {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.method-icon {
+    font-size: 1.25rem;
+}
+
+.method-name {
+    font-weight: 600;
+    color: #e5e7eb;
+}
+
+.method-status {
+    padding: 0.25rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.method-status.enabled {
+    background: rgba(34, 197, 94, 0.2);
+    color: #22c55e;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.method-status.disabled {
+    background: rgba(156, 163, 175, 0.2);
+    color: #9ca3af;
+    border: 1px solid rgba(156, 163, 175, 0.3);
+}
+
+.method-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.security-info {
+    margin-top: 1rem;
+}
+
+.security-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem;
+    margin-bottom: 0.5rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.security-icon {
+    font-size: 1.25rem;
+}
+
+.security-item span:last-child {
+    color: #9ca3af;
 }
 
 /* 卡片样式 */
@@ -3457,6 +4166,7 @@ header h1 {
                     <button class="tab-btn" data-tab="import" onclick="showTabByButton(this, 'import')">📥 导入数据</button>
                     <button class="tab-btn" data-tab="export" onclick="showTabByButton(this, 'export')">📤 导出数据</button>
                     <button class="tab-btn" data-tab="webdav" onclick="showTabByButton(this, 'webdav')">☁️ WebDAV备份</button>
+                    <button class="tab-btn" data-tab="settings" onclick="showTabByButton(this, 'settings')">⚙️ 用户设置</button>
                 </div>
                 
                 <div id="accountsTab" class="tab-content active">
@@ -3678,10 +4388,87 @@ header h1 {
                         </div>
                     </div>
                 </div>
+
+                <div id="settingsTab" class="tab-content">
+                    <div class="card">
+                        <h2>用户设置</h2>
+                        <div class="security-notice info">
+                            <strong>⚙️ 功能说明：</strong> 管理您的账号信息、登录方式和安全设置。
+                        </div>
+
+                        <div class="user-profile-section">
+                            <h3>账号信息</h3>
+                            <div id="userProfileInfo" class="profile-info">
+                                <div class="profile-item">
+                                    <label>用户名：</label>
+                                    <span id="profileUsername">-</span>
+                                </div>
+                                <div class="profile-item">
+                                    <label>邮箱：</label>
+                                    <span id="profileEmail">-</span>
+                                </div>
+                                <div class="profile-item">
+                                    <label>注册时间：</label>
+                                    <span id="profileCreatedAt">-</span>
+                                </div>
+                                <div class="profile-item">
+                                    <label>最后登录：</label>
+                                    <span id="profileLastLogin">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="login-methods-section">
+                            <h3>登录方式</h3>
+                            <div id="loginMethodsInfo" class="login-methods">
+                                <div class="method-item">
+                                    <div class="method-info">
+                                        <span class="method-icon">🔑</span>
+                                        <span class="method-name">密码登录</span>
+                                        <span id="passwordMethodStatus" class="method-status">-</span>
+                                    </div>
+                                </div>
+                                <div class="method-item">
+                                    <div class="method-info">
+                                        <span class="method-icon">🔗</span>
+                                        <span class="method-name">OAuth登录</span>
+                                        <span id="oauthMethodStatus" class="method-status">-</span>
+                                    </div>
+                                    <div class="method-actions">
+                                        <button id="oauthBindBtn" onclick="bindOAuthAccount()" class="btn btn-primary btn-small" style="display: none;">
+                                            绑定OAuth账号
+                                        </button>
+                                        <button id="oauthUnbindBtn" onclick="unbindOAuthAccount()" class="btn btn-danger btn-small" style="display: none;">
+                                            解除绑定
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="security-section">
+                            <h3>安全信息</h3>
+                            <div class="security-info">
+                                <div class="security-item">
+                                    <span class="security-icon">🛡️</span>
+                                    <span>数据加密存储，端到端安全保护</span>
+                                </div>
+                                <div class="security-item">
+                                    <span class="security-icon">🔒</span>
+                                    <span>会话2小时自动过期</span>
+                                </div>
+                                <div class="security-item">
+                                    <span class="security-icon">📝</span>
+                                    <span>所有操作都有安全日志记录</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </main>
     </div>
-    
+
     <div id="modal" class="modal hidden">
         <div class="modal-content">
             <div class="modal-header">
@@ -4033,32 +4820,43 @@ header h1 {
         async function handleOAuthCallbackSuccess(code, state) {
             try {
                 showFloatingMessage('🔄 正在验证授权信息...', 'warning');
-                
+
                 const response = await fetch('/api/oauth/callback', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code, state })
                 });
-                
+
                 const data = await response.json();
-                
+
                 if (response.ok && data.success) {
-                    authToken = data.token;
-                    userInfo = data.userInfo;
-                    loginTime = Date.now();
-                    
-                    localStorage.setItem('authToken', authToken);
-                    localStorage.setItem('userInfo', JSON.stringify(userInfo));
-                    localStorage.setItem('loginTime', loginTime);
-                    
-                    window.history.replaceState({}, document.title, window.location.pathname);
-                    
-                    showMainSection();
-                    refreshAccounts();
-                    startSessionTimer();
-                    showFloatingMessage('✅ OAuth授权登录成功！', 'success');
+                    // 检查是否为绑定操作
+                    if (data.oauthInfo) {
+                        // OAuth绑定成功
+                        window.history.replaceState({}, document.title, window.location.pathname);
+                        showFloatingMessage('✅ OAuth账号绑定成功！', 'success');
+                        // 重新加载用户资料以更新绑定状态
+                        loadUserProfile();
+                    } else {
+                        // OAuth登录成功
+                        authToken = data.token;
+                        userInfo = data.userInfo;
+                        loginTime = Date.now();
+
+                        localStorage.setItem('authToken', authToken);
+                        localStorage.setItem('userInfo', JSON.stringify(userInfo));
+                        localStorage.setItem('loginTime', loginTime);
+
+                        window.history.replaceState({}, document.title, window.location.pathname);
+
+                        showMainSection();
+                        refreshAccounts();
+                        startSessionTimer();
+                        showFloatingMessage('✅ OAuth授权登录成功！', 'success');
+                    }
                 } else {
-                    showFloatingMessage('❌ OAuth授权验证失败：' + (data.error || '未知错误'), 'error');
+                    const errorMessage = data.message || data.error || '未知错误';
+                    showFloatingMessage('❌ OAuth授权验证失败：' + errorMessage, 'error');
                     window.history.replaceState({}, document.title, window.location.pathname);
                 }
             } catch (error) {
@@ -4301,18 +5099,146 @@ header h1 {
             document.querySelectorAll('.tab-content').forEach(tab => {
                 tab.classList.remove('active');
             });
-            
+
             document.querySelectorAll('.tab-btn').forEach(btn => {
                 btn.classList.remove('active');
             });
-            
+
             document.getElementById(tabName + 'Tab').classList.add('active');
             buttonElement.classList.add('active');
-            
+
             if (tabName === 'accounts') {
                 refreshAccounts();
             } else if (tabName === 'webdav') {
                 loadWebDAVConfigs();
+            } else if (tabName === 'settings') {
+                loadUserProfile();
+            }
+        }
+
+        // ===== 用户设置相关函数 =====
+        async function loadUserProfile() {
+            try {
+                showFloatingMessage('🔄 正在加载用户信息...', 'warning');
+
+                const response = await fetch('/api/user/profile', {
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        handleUnauthorized();
+                        return;
+                    }
+                    throw new Error('Failed to load user profile');
+                }
+
+                const data = await response.json();
+                if (!data.success || !data.profile) {
+                    throw new Error('Invalid profile data');
+                }
+
+                // 更新用户资料信息
+                const profile = data.profile;
+                document.getElementById('profileUsername').textContent = profile.username;
+                document.getElementById('profileEmail').textContent = profile.email;
+                document.getElementById('profileCreatedAt').textContent = formatDate(profile.createdAt);
+                document.getElementById('profileLastLogin').textContent = profile.lastLoginAt ? formatDate(profile.lastLoginAt) : '从未登录';
+
+                // 更新登录方式状态
+                const passwordStatus = document.getElementById('passwordMethodStatus');
+                const oauthStatus = document.getElementById('oauthMethodStatus');
+                const oauthBindBtn = document.getElementById('oauthBindBtn');
+                const oauthUnbindBtn = document.getElementById('oauthUnbindBtn');
+
+                // 密码登录状态
+                if (profile.loginMethods.includes('password')) {
+                    passwordStatus.textContent = '已启用';
+                    passwordStatus.className = 'method-status enabled';
+                } else {
+                    passwordStatus.textContent = '未启用';
+                    passwordStatus.className = 'method-status disabled';
+                }
+
+                // OAuth登录状态
+                if (profile.hasOAuthBinding) {
+                    oauthStatus.textContent = '已绑定';
+                    oauthStatus.className = 'method-status enabled';
+                    oauthBindBtn.style.display = 'none';
+                    oauthUnbindBtn.style.display = 'inline-block';
+                } else {
+                    oauthStatus.textContent = '未绑定';
+                    oauthStatus.className = 'method-status disabled';
+                    oauthBindBtn.style.display = 'inline-block';
+                    oauthUnbindBtn.style.display = 'none';
+                }
+
+                showFloatingMessage('✅ 用户信息加载成功', 'success');
+            } catch (error) {
+                console.error('Failed to load user profile:', error);
+                showFloatingMessage('❌ 加载用户信息失败: ' + error.message, 'error');
+            }
+        }
+
+        function formatDate(dateString) {
+            try {
+                const date = new Date(dateString);
+                return date.toLocaleString('zh-CN', {
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+            } catch (e) {
+                return dateString;
+            }
+        }
+
+        async function bindOAuthAccount() {
+            try {
+                showFloatingMessage('🔄 正在跳转到OAuth授权页面...', 'warning');
+
+                // 在跳转前，先设置一个临时cookie来标识绑定操作和用户身份
+                const bindUserData = JSON.stringify({
+                    userId: userInfo.id,
+                    timestamp: Date.now()
+                });
+                document.cookie = 'oauth_bind_user=' + encodeURIComponent(bindUserData) + '; Path=/; Secure; SameSite=Lax; Max-Age=600';
+
+                // 使用统一的OAuth授权端点，通过action参数区分绑定操作
+                window.location.href = '/api/oauth/authorize?action=bind';
+            } catch (error) {
+                console.error('Failed to start OAuth binding:', error);
+                showFloatingMessage('❌ 绑定失败: ' + error.message, 'error');
+            }
+        }
+
+        async function unbindOAuthAccount() {
+            try {
+                if (!confirm('确定要解除OAuth账号绑定吗？解除后将无法使用OAuth登录。')) {
+                    return;
+                }
+
+                showFloatingMessage('🔄 正在解除绑定...', 'warning');
+
+                const response = await fetch('/api/oauth/bind', {
+                    method: 'DELETE',
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    showFloatingMessage('✅ OAuth账号解绑成功', 'success');
+                    loadUserProfile(); // 重新加载用户资料
+                } else {
+                    throw new Error(data.message || '解绑失败');
+                }
+            } catch (error) {
+                console.error('Failed to unbind OAuth account:', error);
+                showFloatingMessage('❌ 解绑失败: ' + error.message, 'error');
             }
         }
         
@@ -7190,6 +8116,9 @@ export default {
             if (path === '/api/auth/migrate') return await handleDataMigration(request, env);
             if (path === '/api/oauth/authorize') return await handleOAuthAuthorize(request, env);
             if (path === '/api/oauth/callback') return await handleOAuthCallback(request, env);
+
+            if (path === '/api/oauth/bind') return await handleOAuthUnbind(request, env);
+            if (path === '/api/user/profile') return await handleUserProfile(request, env);
             if (path === '/api/accounts') return await handleAccounts(request, env);
             if (path === '/api/accounts/clear-all') return await handleClearAllAccounts(request, env);
             if (path.startsWith('/api/accounts/')) {
